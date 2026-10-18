@@ -1,14 +1,86 @@
 #include "EiInput.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstdlib>
 #include <linux/input-event-codes.h>
+#include <optional>
 #include <poll.h>
+#include <string_view>
+#include <thread>
 
 #include <libei.h>
 
 #include "MaaUtils/Logger.h"
 
 MAA_CTRL_UNIT_NS_BEGIN
+
+namespace
+{
+
+// fork: gamescope/libei 点击时序，硬编码为选定的修复行为（不依赖任何外部文件）：
+//   press_split_ms   touch_down 中移动与按下拆分为两个 EI frame 的间隔（0 = 同 frame，stock 行为）
+//   release_delay_ms touch_up 发送抬起 frame 前的额外等待，叠加在框架侧固定 50ms 之上
+//   release_repeat   抬起 frame 的发送次数（幂等），用于对抗丢帧
+// stock 行为为 0 / 0 / 1。一般无需设置；如需临时试验，可用环境变量
+// MAA_EI_PRESS_SPLIT_MS / MAA_EI_RELEASE_DELAY_MS / MAA_EI_RELEASE_REPEAT 覆盖。
+constexpr int kDefaultPressSplitMs = 30;
+constexpr int kDefaultReleaseDelayMs = 100;
+constexpr int kDefaultReleaseRepeat = 2;
+constexpr int kMaxPressSplitMs = 1000;
+constexpr int kMaxReleaseDelayMs = 5000;
+constexpr int kMaxReleaseRepeat = 5;
+constexpr int kReleaseRepeatGapMs = 5;
+
+std::string_view trim(std::string_view text)
+{
+    constexpr std::string_view kSpaces = " \t\r\n";
+    const auto begin = text.find_first_not_of(kSpaces);
+    if (begin == std::string_view::npos) {
+        return { };
+    }
+    const auto end = text.find_last_not_of(kSpaces);
+    return text.substr(begin, end - begin + 1);
+}
+
+std::optional<long> parse_long(std::string_view text)
+{
+    text = trim(text);
+    if (text.empty()) {
+        return std::nullopt;
+    }
+
+    long value = 0;
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (ec != std::errc { } || ptr != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+int resolve_tuning(std::string_view key, const char* env_name, int default_value, int min_value, int max_value)
+{
+    long value = default_value;
+    const char* source = "hardcoded";
+
+    if (const char* raw = std::getenv(env_name); raw && raw[0] != '\0') {
+        if (auto parsed = parse_long(raw)) {
+            value = *parsed;
+            source = "env";
+        }
+        else {
+            LogWarn << "invalid env value, ignored" << VAR(env_name) << VAR(raw);
+        }
+    }
+
+    const auto clamped = std::clamp(value, static_cast<long>(min_value), static_cast<long>(max_value));
+    LogInfo << "EiInput tuning" << VAR(key) << VAR(clamped) << VAR(source);
+    return static_cast<int>(clamped);
+}
+
+} // namespace
 
 EiInput::EiInput(std::string eis_socket_path)
     : eis_socket_path_(std::move(eis_socket_path))
@@ -30,6 +102,8 @@ MaaControllerFeature EiInput::get_features() const
 bool EiInput::init()
 {
     LogFunc;
+
+    load_tuning();
 
     auto cleanup = [this]() {
         if (device_) {
@@ -100,6 +174,13 @@ void EiInput::shutdown()
     }
     ei_fd_ = -1;
     connected_ = false;
+}
+
+void EiInput::load_tuning()
+{
+    press_split_ms_ = resolve_tuning("press_split_ms", "MAA_EI_PRESS_SPLIT_MS", kDefaultPressSplitMs, 0, kMaxPressSplitMs);
+    release_delay_ms_ = resolve_tuning("release_delay_ms", "MAA_EI_RELEASE_DELAY_MS", kDefaultReleaseDelayMs, 0, kMaxReleaseDelayMs);
+    release_repeat_ = resolve_tuning("release_repeat", "MAA_EI_RELEASE_REPEAT", kDefaultReleaseRepeat, 1, kMaxReleaseRepeat);
 }
 
 bool EiInput::click(int x, int y)
@@ -298,32 +379,61 @@ bool EiInput::pointer(EventPhase phase, int x, int y, int contact)
         break;
     }
 
-    auto emit = [phase, x, y, btn](struct ei_device* d) {
-        switch (phase) {
-        case EventPhase::Began:
-            ei_device_pointer_motion_absolute(d, static_cast<double>(x), static_cast<double>(y));
-            ei_device_button_button(d, btn, true);
-            break;
-        case EventPhase::Moved:
-            ei_device_pointer_motion_absolute(d, static_cast<double>(x), static_cast<double>(y));
-            break;
-        case EventPhase::Ended:
-            ei_device_button_button(d, btn, false);
-            break;
-        }
-    };
-
     switch (phase) {
     case EventPhase::Began:
-        return send({ EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON }, emit);
+        return pointer_began(x, y, btn);
     case EventPhase::Moved:
-        return send({ EI_DEVICE_CAP_POINTER_ABSOLUTE }, emit);
+        return send({ EI_DEVICE_CAP_POINTER_ABSOLUTE }, [x, y](struct ei_device* d) {
+            ei_device_pointer_motion_absolute(d, static_cast<double>(x), static_cast<double>(y));
+        });
     case EventPhase::Ended:
-        return send({ EI_DEVICE_CAP_BUTTON }, emit);
+        return pointer_ended(btn);
     default:
         break;
     }
     return false;
+}
+
+bool EiInput::pointer_began(int x, int y, int btn)
+{
+    if (press_split_ms_ <= 0) {
+        LogTrace << "ei pointer began, single frame" << VAR(x) << VAR(y) << VAR(btn);
+        return send({ EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON }, [x, y, btn](struct ei_device* d) {
+            ei_device_pointer_motion_absolute(d, static_cast<double>(x), static_cast<double>(y));
+            ei_device_button_button(d, btn, true);
+        });
+    }
+
+    // fork: 移动与按下拆成两个 frame 发送，避免合成器在同一帧内合并/丢失
+    LogTrace << "ei pointer began, motion frame" << VAR(x) << VAR(y);
+    if (!send({ EI_DEVICE_CAP_POINTER_ABSOLUTE }, [x, y](struct ei_device* d) {
+            ei_device_pointer_motion_absolute(d, static_cast<double>(x), static_cast<double>(y));
+        })) {
+        return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(press_split_ms_));
+
+    LogTrace << "ei pointer began, press frame" << VAR(btn) << VAR(press_split_ms_);
+    return send({ EI_DEVICE_CAP_BUTTON }, [btn](struct ei_device* d) { ei_device_button_button(d, btn, true); });
+}
+
+bool EiInput::pointer_ended(int btn)
+{
+    // fork: 抬起前额外等待（叠加框架侧固定 50ms），并按配置重复发送抬起 frame（幂等，抗丢帧）
+    if (release_delay_ms_ > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(release_delay_ms_));
+    }
+
+    bool ret = true;
+    for (int i = 0; i < release_repeat_; ++i) {
+        if (i > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kReleaseRepeatGapMs));
+        }
+        LogTrace << "ei pointer ended, release frame" << VAR(btn) << VAR(i + 1) << VAR(release_repeat_);
+        ret = send({ EI_DEVICE_CAP_BUTTON }, [btn](struct ei_device* d) { ei_device_button_button(d, btn, false); }) && ret;
+    }
+    return ret;
 }
 
 bool EiInput::keyboard_key(EventPhase phase, int evdev_key)

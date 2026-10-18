@@ -53,11 +53,16 @@ public:
 
 private:
     bool pointer(EventPhase phase, int x, int y, int contact);
+    bool pointer_began(int x, int y, int btn);
+    bool pointer_ended(int btn);
     bool keyboard_key(EventPhase phase, int evdev_key);
     bool text_utf8(const std::string& text);
 
     int poll_and_dispatch(int timeout_ms);
     void handle_event(struct ei_event* event);
+
+    // fork: 从 ei_fork.conf / 环境变量加载点击时序调参（init() 时调用）
+    void load_tuning();
 
     template <typename F>
     bool send(std::initializer_list<enum ei_device_capability> required_caps, F&& emit);
@@ -72,6 +77,12 @@ private:
     bool connected_ = false;
 
     uint64_t emul_seq_ = 0;
+
+    // fork: gamescope/libei 点击时序，init() 时由 load_tuning() 载入（硬编码默认值，可用环境变量临时覆盖）；
+    // 这里保留 stock 行为作为未初始化时的兜底
+    int press_split_ms_ = 0;
+    int release_delay_ms_ = 0;
+    int release_repeat_ = 1;
 };
 
 MAA_CTRL_UNIT_NS_END
